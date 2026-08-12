@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/
+dataset/
+datasets/raw/
+*.zip
+*.tar
+*.tar.gz
+
+# Outputs
+outputs/
+runs/
+wandb/
+logs/
+
+# Checkpoints / weights
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
