@@ -104,6 +104,8 @@ class MiniGuidedBlock(nn.Module):
         drop_path: float = 0.0,
         allocator_hidden_dim: int = 128,
         has_cls_token: bool = True,
+        gumbel_tau: float = 1.0,
+        use_gumbel: bool = True,
         norm_layer=nn.LayerNorm,
         act_layer=nn.GELU,
     ):
@@ -125,6 +127,8 @@ class MiniGuidedBlock(nn.Module):
             proj_drop=drop,
             allocator_hidden_dim=allocator_hidden_dim,
             has_cls_token=has_cls_token,
+            gumbel_tau=gumbel_tau,
+            use_gumbel=use_gumbel,
         )
 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

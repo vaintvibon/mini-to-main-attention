@@ -15,7 +15,7 @@ env/
 
 # Data
 data/
-dataset/
+datasets/
 datasets/raw/
 *.zip
 *.tar

@@ -1,5 +1,3 @@
-# models/two_level_attention.py
-
 from typing import Optional, Tuple
 
 import torch
@@ -12,10 +10,13 @@ from models.two_level_scheduler import TwoLevelHeadScheduler
 
 class TwoLevelMiniMainAttention(nn.Module):
     """
-    v1 Two-Level Mini-to-Main Attention.
+    v1 Two-Level Mini-to-Main Attention + differentiable Gumbel-ST scheduling.
 
-    v1은 모든 Main head를 계산한 뒤 inactive head output에 mask를 적용한다.
-    따라서 구조 검증용이며, 실제 계산량 절감은 v2 selective computation에서 다룬다.
+    중요:
+        - 여전히 모든 Main head Q/K/V + attention을 계산한 뒤 gate를 적용한다.
+          따라서 이 파일은 구조/학습 검증용 v1이며, FLOPs 절감 주장은 불가능하다.
+        - 하지만 scheduler의 active/direct/mixed gate는 Straight-Through estimator이므로
+          classification loss gradient가 allocator까지 전달된다.
     """
 
     def __init__(
@@ -33,6 +34,8 @@ class TwoLevelMiniMainAttention(nn.Module):
         proj_drop: float = 0.0,
         allocator_hidden_dim: int = 128,
         has_cls_token: bool = True,
+        gumbel_tau: float = 1.0,
+        use_gumbel: bool = True,
     ):
         super().__init__()
 
@@ -76,6 +79,8 @@ class TwoLevelMiniMainAttention(nn.Module):
         self.scheduler = TwoLevelHeadScheduler(
             main_heads=main_heads,
             direct_ratio=direct_ratio,
+            gumbel_tau=gumbel_tau,
+            use_gumbel=use_gumbel,
         )
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -87,6 +92,9 @@ class TwoLevelMiniMainAttention(nn.Module):
 
         self.out_proj = nn.Linear(dim, dim)
         self.out_drop = nn.Dropout(proj_drop)
+
+    def set_gumbel_temperature(self, tau: float) -> None:
+        self.scheduler.set_temperature(tau)
 
     def forward(
         self,
@@ -111,28 +119,27 @@ class TwoLevelMiniMainAttention(nn.Module):
         )
 
         # 2. Mini importance
-        importance_feat, importance_stats = self.mini_importance(
-            mini_attn_score
-        )
+        importance_feat, importance_stats = self.mini_importance(mini_attn_score)
 
         # 3. Mini-to-Main allocation logits
-        alloc_logits = self.allocator(
-            c_m,
-            importance_feat,
-        )
+        alloc_logits = self.allocator(c_m, importance_feat)
 
         # 4. Scheduler
-        schedule_out = self.scheduler(
-            alloc_logits,
-            budget=budget,
-        )
+        schedule_out = self.scheduler(alloc_logits, budget=budget)
 
+        # hard masks: logging / diversity pairing / exact semantic checks
         active_mask = schedule_out["active_mask"]
         direct_mask = schedule_out["direct_mask"]
         mixed_mask = schedule_out["mixed_mask"]
         inactive_mask = schedule_out["inactive_mask"]
 
+        # differentiable gates: MUST be used in actual forward computation
+        active_gate = schedule_out["active_gate"]
+        direct_gate = schedule_out["direct_gate"]
+        mixed_gate = schedule_out["mixed_gate"]
+
         # 5. Budget 0: Mini-only path
+        # Allocation decision itself is irrelevant when no Main head can be used.
         if budget == 0:
             zero_main_out = torch.zeros_like(c_m)
             zero_head_out = x.new_zeros(B, self.main_heads, N, self.head_dim)
@@ -151,6 +158,10 @@ class TwoLevelMiniMainAttention(nn.Module):
                     "direct_mask": direct_mask,
                     "mixed_mask": mixed_mask,
                     "inactive_mask": inactive_mask,
+                    "active_gate": active_gate,
+                    "direct_gate": direct_gate,
+                    "mixed_gate": mixed_gate,
+                    "selection_scores": schedule_out["selection_scores"],
                     "head_out": zero_head_out,
                     "main_out": zero_main_out,
                     "scheduler_stats": schedule_out["stats"],
@@ -159,7 +170,7 @@ class TwoLevelMiniMainAttention(nn.Module):
 
             return out
 
-        # 6. Main QKV
+        # 6. Main QKV (v1: all heads are still densely computed)
         qkv = self.qkv(x)  # [B, N, 3D]
 
         qkv = qkv.reshape(
@@ -184,13 +195,14 @@ class TwoLevelMiniMainAttention(nn.Module):
             self.head_dim,
         ).permute(0, 2, 1, 3)  # [B, H, N, Dh]
 
+        # IMPORTANT:
+        # bool mask가 아니라 ST gate를 사용해야 allocator까지 gradient가 연결된다.
         alpha = (
-            direct_mask.float() * self.alpha_direct
-            + mixed_mask.float() * self.alpha_mixed
+            direct_gate * self.alpha_direct
+            + mixed_gate * self.alpha_mixed
         )  # [B, H]
 
         alpha = alpha[:, :, None, None]  # [B, H, 1, 1]
-
         q = q + alpha * seed
 
         # 8. Main attention
@@ -200,13 +212,14 @@ class TwoLevelMiniMainAttention(nn.Module):
 
         head_out = main_attn @ v  # [B, H, N, Dh]
 
-        # diversity loss용 head output.
-        # detach 하면 diversity loss gradient가 끊기므로 detach 하지 않는다.
+        # diversity loss는 hard direct/mixed pair를 사용하되,
+        # head representation 자체에는 gradient가 유지되어야 하므로 detach하지 않는다.
         head_out_for_loss = head_out
 
-        # 9. inactive head output masking
-        active_float = active_mask.float()[:, :, None, None]  # [B, H, 1, 1]
-        head_out = head_out * active_float
+        # 9. Active ST gate 적용
+        # forward에서는 exact 0/1 hard mask와 동일,
+        # backward에서는 relaxed Top-K gradient가 allocator로 흐른다.
+        head_out = head_out * active_gate[:, :, None, None]
 
         # [B, H, N, Dh] -> [B, N, D]
         main_out = head_out.transpose(1, 2).reshape(B, N, D)
@@ -230,6 +243,10 @@ class TwoLevelMiniMainAttention(nn.Module):
                 "direct_mask": direct_mask,
                 "mixed_mask": mixed_mask,
                 "inactive_mask": inactive_mask,
+                "active_gate": active_gate,
+                "direct_gate": direct_gate,
+                "mixed_gate": mixed_gate,
+                "selection_scores": schedule_out["selection_scores"],
                 "main_attn": main_attn,
                 "head_out": head_out_for_loss,
                 "main_out": main_out,

@@ -103,6 +103,8 @@ class MiniGuidedViT(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         allocator_hidden_dim: int = 128,
+        gumbel_tau: float = 1.0,
+        use_gumbel: bool = True,
     ):
         super().__init__()
 
@@ -155,6 +157,8 @@ class MiniGuidedViT(nn.Module):
                     drop_path=dpr[i],
                     allocator_hidden_dim=allocator_hidden_dim,
                     has_cls_token=True,
+                    gumbel_tau=gumbel_tau,
+                    use_gumbel=use_gumbel,
                 )
                 for i in range(depth)
             ]
@@ -183,6 +187,11 @@ class MiniGuidedViT(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+
+    def set_gumbel_temperature(self, tau: float) -> None:
+        """모든 block의 scheduler temperature를 한 번에 갱신한다."""
+        for block in self.blocks:
+            block.attn.set_gumbel_temperature(tau)
 
     def forward_features(
         self,

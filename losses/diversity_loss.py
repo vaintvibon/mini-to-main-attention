@@ -112,7 +112,9 @@ class HeadDiversityLoss(nn.Module):
         denom = pair_mask.sum()
 
         if denom.item() == 0:
-            return head_out.new_tensor(0.0)
+            # 값은 0이지만 head_out과 graph 연결을 유지한다.
+            # budget=1처럼 direct-mixed pair가 없는 경우에도 loss.backward()가 안전하다.
+            return head_out.sum() * 0.0
 
         # similarity가 클수록 penalty
         loss = ((sim ** 2) * pair_mask).sum() / (denom + self.eps)
