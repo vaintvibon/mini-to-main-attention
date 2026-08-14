@@ -337,21 +337,25 @@ def fixed_allocation(
         def override_forward(
             self_scheduler,
             alloc_logits,
-            runtime_budget,
+            budget,
             *,
-            _budget=budget,
+            _expected_budget=budget,
             _ordered_heads=tuple(ordered_heads),
         ):
-            if runtime_budget != _budget:
+            # 원래 scheduler가
+            # self.scheduler(alloc_logits, budget=budget)
+            # 형태로 keyword argument를 사용하므로
+            # 파라미터 이름도 반드시 budget이어야 한다.
+            if budget != _expected_budget:
                 raise ValueError(
-                    f"Expected budget={_budget}, "
-                    f"got {runtime_budget}."
+                    f"Expected budget={_expected_budget}, "
+                    f"got {budget}."
                 )
 
             return _build_fixed_schedule(
                 scheduler=self_scheduler,
                 alloc_logits=alloc_logits,
-                budget=runtime_budget,
+                budget=budget,
                 ordered_heads=_ordered_heads,
             )
 
