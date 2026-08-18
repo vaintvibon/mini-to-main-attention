@@ -1,6 +1,6 @@
-# models/dynamic_mini_main_block.py
+COUNTERFACTUAL_API_VERSION = "cf_v2"
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -9,12 +9,6 @@ from models.dynamic_mini_main_attention import DynamicMiniMainAttention
 
 
 class DropPath(nn.Module):
-    """
-    Stochastic Depth.
-
-    drop_prob=0이면 identity와 동일하게 동작한다.
-    """
-
     def __init__(
         self,
         drop_prob: float = 0.0,
@@ -34,7 +28,6 @@ class DropPath(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-
         if (
             self.drop_prob == 0.0
             or not self.training
@@ -73,17 +66,6 @@ class DropPath(nn.Module):
 
 
 class Mlp(nn.Module):
-    """
-    Standard ViT MLP.
-
-    x
-      -> Linear
-      -> GELU
-      -> Dropout
-      -> Linear
-      -> Dropout
-    """
-
     def __init__(
         self,
         dim: int,
@@ -116,126 +98,34 @@ class Mlp(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-
         x = self.fc1(x)
-
         x = self.act(x)
-
         x = self.drop1(x)
-
         x = self.fc2(x)
-
         x = self.drop2(x)
 
         return x
 
 
 class DynamicMiniMainBlock(nn.Module):
-    """
-    Transformer Block using Dynamic Mini-to-Main Attention.
-
-    구조
-    ----
-
-        x
-        │
-        ├───────────────────────────────┐
-        │                               │
-        ▼                               │
-       LN                               │
-        │                               │
-        ▼                               │
-    DynamicMiniMainAttention            │
-        │                               │
-        └────────────── + ◀─────────────┘
-                        │
-                        ▼
-                        x
-                        │
-        ┌───────────────┴──────────────┐
-        │                              │
-        ▼                              │
-       LN                              │
-        │                              │
-        ▼                              │
-       MLP                             │
-        │                              │
-        └────────────── + ◀────────────┘
-                        │
-                        ▼
-                      output
-
-
-    즉 Pre-LayerNorm Transformer 구조다.
-
-    Attention 내부에서는:
-
-        Multi Mini
-            ↓
-        Utility
-            ↓
-        Direct / Mix
-            ↓
-        Dynamic Mini -> Main Binding
-            ↓
-        Main Q-Seeding
-            ↓
-        Main Attention
-
-    이 수행된다.
-    """
-
     def __init__(
         self,
         dim: int = 192,
-
-        # ---------------------------------------------------------
-        # Main
-        # ---------------------------------------------------------
-
         main_heads: int = 3,
-
-        # ---------------------------------------------------------
-        # Mini
-        # ---------------------------------------------------------
-
         mini_heads: int = 4,
         mini_head_dim: int = 16,
         pool_ratio: int = 2,
-
-        # ---------------------------------------------------------
-        # Utility
-        # ---------------------------------------------------------
-
         utility_hidden_dim: int = 64,
         utility_dropout: float = 0.0,
-
-        # ---------------------------------------------------------
-        # Direct / Mix
-        # ---------------------------------------------------------
-
         direct_k: int = 2,
         mix_temperature: float = 1.0,
-
-        # ---------------------------------------------------------
-        # Binding
-        # ---------------------------------------------------------
-
         bind_dim: int = 64,
         bind_temperature: float = 1.0,
-
-        # ---------------------------------------------------------
-        # Transformer
-        # ---------------------------------------------------------
-
         mlp_ratio: float = 4.0,
-
         qkv_bias: bool = True,
-
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
-
         has_cls_token: bool = True,
     ):
         super().__init__()
@@ -250,53 +140,33 @@ class DynamicMiniMainBlock(nn.Module):
                 f"mlp_ratio must be > 0, got {mlp_ratio}"
             )
 
-        # =========================================================
-        # Attention branch
-        # =========================================================
-
         self.norm1 = nn.LayerNorm(
             dim
         )
 
         self.attn = DynamicMiniMainAttention(
             dim=dim,
-
+            main_heads=main_heads,
             mini_heads=mini_heads,
             mini_head_dim=mini_head_dim,
             pool_ratio=pool_ratio,
-
             utility_hidden_dim=utility_hidden_dim,
             utility_dropout=utility_dropout,
-
             direct_k=direct_k,
-
             mix_temperature=mix_temperature,
-
-            main_heads=main_heads,
-
             bind_dim=bind_dim,
             bind_temperature=bind_temperature,
-
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=drop,
-
             has_cls_token=has_cls_token,
         )
 
-        if drop_path > 0:
-
-            self.drop_path1 = DropPath(
-                drop_path
-            )
-
-        else:
-
-            self.drop_path1 = nn.Identity()
-
-        # =========================================================
-        # MLP branch
-        # =========================================================
+        self.drop_path1 = (
+            DropPath(drop_path)
+            if drop_path > 0
+            else nn.Identity()
+        )
 
         self.norm2 = nn.LayerNorm(
             dim
@@ -312,15 +182,11 @@ class DynamicMiniMainBlock(nn.Module):
             drop=drop,
         )
 
-        if drop_path > 0:
-
-            self.drop_path2 = DropPath(
-                drop_path
-            )
-
-        else:
-
-            self.drop_path2 = nn.Identity()
+        self.drop_path2 = (
+            DropPath(drop_path)
+            if drop_path > 0
+            else nn.Identity()
+        )
 
     def set_mix_temperature(
         self,
@@ -341,37 +207,22 @@ class DynamicMiniMainBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        patch_hw: Optional[
-            Tuple[int, int]
-        ] = None,
+        patch_hw=None,
         return_info: bool = False,
+        collect_taylor: bool = False,
+        forced_direct_indices: Optional[torch.Tensor] = None,
+        forced_uniform_mix: bool = False,
     ):
-        """
-        Input
-        -----
-        x:
-            [B,N,D]
-
-
-        Output
-        ------
-        x:
-            [B,N,D]
-
-        return_info=True:
-            x, attention_info
-        """
-
-        # =========================================================
-        # 1. Attention branch
-        # =========================================================
+        if collect_taylor and not return_info:
+            raise ValueError(
+                "collect_taylor=True requires return_info=True."
+            )
 
         norm_x = self.norm1(
             x
         )
 
         if return_info:
-
             (
                 attn_out,
                 info,
@@ -379,17 +230,20 @@ class DynamicMiniMainBlock(nn.Module):
                 norm_x,
                 patch_hw=patch_hw,
                 return_info=True,
+                collect_taylor=collect_taylor,
+                forced_direct_indices=forced_direct_indices,
+                forced_uniform_mix=forced_uniform_mix,
             )
-
         else:
-
             attn_out = self.attn(
                 norm_x,
                 patch_hw=patch_hw,
                 return_info=False,
+                collect_taylor=False,
+                forced_direct_indices=forced_direct_indices,
+                forced_uniform_mix=forced_uniform_mix,
             )
 
-        # Residual
         x = (
             x
             +
@@ -398,17 +252,12 @@ class DynamicMiniMainBlock(nn.Module):
             )
         )
 
-        # =========================================================
-        # 2. MLP branch
-        # =========================================================
-
         mlp_out = self.mlp(
             self.norm2(
                 x
             )
         )
 
-        # Residual
         x = (
             x
             +
@@ -418,7 +267,6 @@ class DynamicMiniMainBlock(nn.Module):
         )
 
         if return_info:
-
             return (
                 x,
                 info,

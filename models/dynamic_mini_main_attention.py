@@ -1,6 +1,6 @@
-# models/dynamic_mini_main_attention.py
+COUNTERFACTUAL_API_VERSION = "cf_v2"
 
-from typing import Optional, Tuple, Dict, Any
+from typing import Dict, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -17,98 +17,54 @@ class DynamicMiniMainAttention(nn.Module):
     """
     Dynamic Mini-to-Main Attention.
 
-    전체 연구 구조를 하나로 묶은 Attention module.
+    Final dynamic mode:
+        Mini -> Utility Predictor -> Top-K Direct / Remaining
+             -> Remaining utility-weighted Mix
+             -> Dynamic Mini->Main Binding
+             -> Main Q-Seeding
 
-    구조
-    ----
-    1. Multi Mini Attention
-        여러 Mini Head가 저비용 attention 수행
+    Stage-1 / Counterfactual mode:
+        forced_direct_indices를 전달하면 Utility Predictor의 Top-K를 우회한다.
+        forced_uniform_mix=True이면 Remaining Mix 역시 Utility Predictor에
+        의존하지 않고 균등 혼합한다.
 
-    2. Mini Head Utility Prediction
-        각 Mini Head가 현재 입력에서 얼마나 유용한지 예측
-
-    3. Dynamic Mini Selection
-        utility가 높은 Top-K Mini Head를 Direct 대상으로 선택
-
-    4. Remaining Mini Mixing
-        Direct되지 않은 Mini Head 정보는 버리지 않고
-        utility-weighted Mix로 요약
-
-    5. Dynamic Mini -> Main Binding
-        Direct Mini들을 입력마다 적절한 Main Head에 1:1 binding
-
-        남은 Main Head는 Mixed Mini 정보를 받음
-
-    6. Bound Main Attention
-        Main Head별 Mini-derived seed를 해당 Main Query에 주입
-
-
-    핵심 연구 의미
-    -------------
-    입력마다:
-
-        어떤 Mini가 중요한지,
-        어떤 Mini가 Direct인지,
-        나머지 Mini가 어떻게 Mix되는지,
-        Direct Mini가 어느 Main에 연결되는지
-
-    가 달라질 수 있다.
-
-
-    Input
-    -----
-    x:
-        [B, N, D]
-
-
-    Output
-    ------
-    out:
-        [B, N, D]
+    이렇게 해야 warm-up / teacher 생성 시 초기 random Utility Predictor가
+    routing을 자기강화하는 문제를 막을 수 있다.
     """
 
     def __init__(
         self,
         dim: int,
-
-        # Mini
         mini_heads: int = 4,
         mini_head_dim: int = 16,
         pool_ratio: int = 2,
-
-        # Mini utility
         utility_hidden_dim: int = 64,
         utility_dropout: float = 0.0,
-
-        # Direct selection
         direct_k: int = 2,
-
-        # Mini mixing
         mix_temperature: float = 1.0,
-
-        # Main
         main_heads: int = 3,
-
-        # Dynamic binding
         bind_dim: int = 64,
         bind_temperature: float = 1.0,
-
-        # Attention
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-
         has_cls_token: bool = True,
     ):
         super().__init__()
 
-        # =========================================================
-        # Validation
-        # =========================================================
-
         if dim <= 0:
             raise ValueError(
                 f"dim must be > 0, got {dim}"
+            )
+
+        if mini_heads <= 0:
+            raise ValueError(
+                f"mini_heads must be > 0, got {mini_heads}"
+            )
+
+        if mini_head_dim <= 0:
+            raise ValueError(
+                f"mini_head_dim must be > 0, got {mini_head_dim}"
             )
 
         if main_heads <= 0:
@@ -122,39 +78,32 @@ class DynamicMiniMainAttention(nn.Module):
                 f"dim={dim}, main_heads={main_heads}"
             )
 
+        if direct_k <= 0:
+            raise ValueError(
+                f"direct_k must be > 0, got {direct_k}"
+            )
+
         if direct_k > mini_heads:
             raise ValueError(
                 "direct_k cannot exceed mini_heads. "
-                f"direct_k={direct_k}, "
-                f"mini_heads={mini_heads}"
+                f"direct_k={direct_k}, mini_heads={mini_heads}"
             )
 
-        # 현재 Binder는
-        # Direct Mini 하나 ↔ Main 하나의
-        # collision-free 1:1 binding 구조다.
         if direct_k > main_heads:
             raise ValueError(
                 "direct_k cannot exceed main_heads "
-                "for 1:1 Direct Binding. "
-                f"direct_k={direct_k}, "
-                f"main_heads={main_heads}"
+                "for collision-free 1:1 binding. "
+                f"direct_k={direct_k}, main_heads={main_heads}"
             )
 
         self.dim = dim
-
         self.mini_heads = mini_heads
         self.mini_head_dim = mini_head_dim
-
         self.main_heads = main_heads
         self.main_head_dim = (
             dim // main_heads
         )
-
         self.direct_k = direct_k
-
-        # =========================================================
-        # 1. Multi Mini Attention
-        # =========================================================
 
         self.mini_attention = MultiMiniAttention(
             dim=dim,
@@ -166,10 +115,6 @@ class DynamicMiniMainAttention(nn.Module):
             has_cls_token=has_cls_token,
         )
 
-        # =========================================================
-        # 2. Mini Head Utility Predictor
-        # =========================================================
-
         self.utility_predictor = MiniHeadUtility(
             mini_head_dim=mini_head_dim,
             hidden_dim=utility_hidden_dim,
@@ -177,27 +122,15 @@ class DynamicMiniMainAttention(nn.Module):
             has_cls_token=has_cls_token,
         )
 
-        # =========================================================
-        # 3. Dynamic Mini Selector
-        # =========================================================
-
         self.selector = DynamicMiniSelector(
             mini_heads=mini_heads,
             direct_k=direct_k,
         )
 
-        # =========================================================
-        # 4. Remaining Mini Mixer
-        # =========================================================
-
         self.mixer = MiniMixer(
             mini_heads=mini_heads,
             temperature=mix_temperature,
         )
-
-        # =========================================================
-        # 5. Dynamic Mini -> Main Binder
-        # =========================================================
 
         self.binder = MiniMainBinder(
             mini_head_dim=mini_head_dim,
@@ -208,27 +141,20 @@ class DynamicMiniMainAttention(nn.Module):
             has_cls_token=has_cls_token,
         )
 
-        # =========================================================
-        # 6. Main Attention
-        # =========================================================
-
+        # Taylor gate의 magnitude 효과를 보존하기 위해 seed LN은 끈다.
         self.main_attention = BoundMainAttention(
             dim=dim,
             main_heads=main_heads,
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
-            normalize_seed=True,
+            normalize_seed=False,
         )
 
     def set_mix_temperature(
         self,
         temperature: float,
     ):
-        """
-        Remaining Mini Mix temperature 변경.
-        """
-
         self.mixer.set_temperature(
             temperature
         )
@@ -237,68 +163,150 @@ class DynamicMiniMainAttention(nn.Module):
         self,
         temperature: float,
     ):
-        """
-        Mini -> Main binding temperature 변경.
-        """
-
         self.binder.set_temperature(
             temperature
+        )
+
+    def _build_forced_selection(
+        self,
+        utility_logits: torch.Tensor,
+        forced_direct_indices: torch.Tensor,
+    ):
+        """
+        Utility Predictor의 Top-K를 우회해 명시적으로 Direct Mini를 지정한다.
+        """
+
+        B, Hm = (
+            utility_logits.shape
+        )
+
+        forced_direct_indices = (
+            forced_direct_indices
+            .to(
+                device=utility_logits.device,
+                dtype=torch.long,
+            )
+        )
+
+        expected_shape = (
+            B,
+            self.direct_k,
+        )
+
+        if tuple(
+            forced_direct_indices.shape
+        ) != expected_shape:
+            raise ValueError(
+                "forced_direct_indices shape mismatch. "
+                f"Expected {expected_shape}, "
+                f"got {tuple(forced_direct_indices.shape)}"
+            )
+
+        if torch.any(
+            forced_direct_indices < 0
+        ) or torch.any(
+            forced_direct_indices >= Hm
+        ):
+            raise ValueError(
+                "forced_direct_indices contains an invalid Mini Head index."
+            )
+
+        sorted_indices = (
+            forced_direct_indices
+            .sort(dim=-1)
+            .values
+        )
+
+        if self.direct_k > 1:
+            duplicate = (
+                sorted_indices[:, 1:]
+                ==
+                sorted_indices[:, :-1]
+            )
+
+            if torch.any(
+                duplicate
+            ):
+                raise ValueError(
+                    "Each sample must contain unique forced Direct Mini indices."
+                )
+
+        direct_mask = torch.zeros(
+            B,
+            Hm,
+            dtype=torch.bool,
+            device=utility_logits.device,
+        )
+
+        direct_mask.scatter_(
+            dim=1,
+            index=forced_direct_indices,
+            value=True,
+        )
+
+        remaining_mask = (
+            ~direct_mask
+        )
+
+        direct_scores = torch.gather(
+            utility_logits,
+            dim=1,
+            index=forced_direct_indices,
+        )
+
+        selection_info = {
+            "direct_indices":
+                forced_direct_indices,
+
+            # logging용. forced routing에서는 선택 근거가 아님.
+            "direct_scores":
+                direct_scores,
+
+            "direct_count":
+                direct_mask.sum(dim=-1),
+
+            "remaining_count":
+                remaining_mask.sum(dim=-1),
+
+            "forced_routing":
+                True,
+        }
+
+        return (
+            direct_mask,
+            remaining_mask,
+            selection_info,
         )
 
     def forward(
         self,
         x: torch.Tensor,
-        patch_hw: Optional[
-            Tuple[int, int]
-        ] = None,
+        patch_hw=None,
         return_info: bool = False,
+        collect_taylor: bool = False,
+        forced_direct_indices: Optional[torch.Tensor] = None,
+        forced_uniform_mix: bool = False,
     ):
-        """
-        Forward.
-
-        Parameters
-        ----------
-        x:
-            [B,N,D]
-
-        patch_hw:
-            patch grid.
-
-            예:
-                14x14 patches
-                -> (14,14)
-
-        return_info:
-            True이면 routing/debug 정보를 함께 반환.
-
-
-        Returns
-        -------
-        out:
-            [B,N,D]
-
-        return_info=True:
-            out, info
-        """
-
         if x.dim() != 3:
             raise ValueError(
                 "Expected x [B,N,D], "
                 f"got {x.shape}"
             )
 
-        B, N, D = x.shape
+        B, _, D = x.shape
 
         if D != self.dim:
             raise ValueError(
-                f"Expected dim={self.dim}, "
-                f"got {D}"
+                f"Expected dim={self.dim}, got {D}"
+            )
+
+        if collect_taylor and not return_info:
+            raise ValueError(
+                "collect_taylor=True requires return_info=True."
             )
 
         # =========================================================
-        # 1. Multi Mini Attention
-        #
-        # 각 Mini Head의 identity를 유지한다.
+        # 1. Mini
         # =========================================================
 
         (
@@ -309,14 +317,11 @@ class DynamicMiniMainAttention(nn.Module):
             patch_hw=patch_hw,
         )
 
-        # mini_contexts:
-        # [B,Hmini,N,Dmini]
-        #
-        # mini_attn:
-        # [B,Hmini,N,M]
-
         # =========================================================
-        # 2. Input-dependent Mini Head Utility
+        # 2. Utility Predictor
+        #
+        # forced mode에서도 logging / Stage-2 student 입력을 위해 계산은 한다.
+        # 단, forced routing과 uniform mix에서는 routing 결정에 쓰이지 않는다.
         # =========================================================
 
         (
@@ -328,41 +333,103 @@ class DynamicMiniMainAttention(nn.Module):
             return_info=True,
         )
 
-        # utility_logits:
-        # [B,Hmini]
-
         # =========================================================
-        # 3. Dynamic Direct Mini Selection
+        # 3. Direct / Remaining
         # =========================================================
 
-        (
-            direct_mask,
-            remaining_mask,
-            selection_info,
-        ) = self.selector(
-            utility_logits,
-            return_info=True,
+        if forced_direct_indices is None:
+            (
+                direct_mask,
+                remaining_mask,
+                selection_info,
+            ) = self.selector(
+                utility_logits,
+                return_info=True,
+            )
+
+            selection_info = dict(
+                selection_info
+            )
+
+            selection_info[
+                "forced_routing"
+            ] = False
+
+        else:
+            (
+                direct_mask,
+                remaining_mask,
+                selection_info,
+            ) = self._build_forced_selection(
+                utility_logits,
+                forced_direct_indices,
+            )
+
+        # =========================================================
+        # 4. Taylor gate
+        # =========================================================
+
+        taylor_gate = torch.ones(
+            B,
+            self.mini_heads,
+            dtype=mini_contexts.dtype,
+            device=mini_contexts.device,
+        )
+
+        if collect_taylor:
+            taylor_gate.requires_grad_()
+
+            if not taylor_gate.requires_grad:
+                raise RuntimeError(
+                    "Taylor gate failed to enable gradients."
+                )
+
+            if not taylor_gate.is_leaf:
+                raise RuntimeError(
+                    "Taylor gate must be a leaf tensor."
+                )
+
+        gated_mini_contexts = (
+            mini_contexts
+            *
+            taylor_gate[
+                :,
+                :,
+                None,
+                None,
+            ]
         )
 
         # =========================================================
-        # 4. Remaining Mini Dynamic Mixing
+        # 5. Remaining Mix
+        #
+        # forced_uniform_mix=True이면 utility logits를 완전히 제거하고
+        # remaining head들을 균등하게 mix한다.
         # =========================================================
+
+        if forced_uniform_mix:
+            mixer_logits = torch.zeros_like(
+                utility_logits
+            )
+        else:
+            mixer_logits = (
+                utility_logits
+            )
 
         (
             mixed_context,
             mix_info,
         ) = self.mixer(
-            mini_contexts,
-            utility_logits,
+            gated_mini_contexts,
+            mixer_logits,
             remaining_mask,
             return_info=True,
         )
 
-        # mixed_context:
-        # [B,N,Dmini]
-
         # =========================================================
-        # 5. Dynamic Mini -> Main Binding
+        # 6. Dynamic Mini -> Main Binding
+        #
+        # binding compatibility는 ungated Mini representation을 사용한다.
         # =========================================================
 
         (
@@ -374,18 +441,12 @@ class DynamicMiniMainAttention(nn.Module):
                 "direct_indices"
             ],
             mixed_context,
+            head_gate=taylor_gate,
             return_info=True,
         )
 
-        # main_seeds:
-        #
-        # [B,Hmain,N,Dmain]
-
         # =========================================================
-        # 6. Main Attention
-        #
-        # each Main Query receives its own
-        # dynamically assigned Mini seed.
+        # 7. Main
         # =========================================================
 
         (
@@ -397,30 +458,22 @@ class DynamicMiniMainAttention(nn.Module):
             return_info=True,
         )
 
-        # out:
-        # [B,N,D]
-
-        # =========================================================
-        # 7. Return
-        # =========================================================
-
         if return_info:
-
             info: Dict[str, Any] = {
+                "taylor_gate":
+                    taylor_gate,
 
-                # -------------------------------------------------
-                # Mini
-                # -------------------------------------------------
+                "gated_mini_contexts":
+                    gated_mini_contexts,
+
+                "collect_taylor":
+                    collect_taylor,
 
                 "mini_contexts":
                     mini_contexts,
 
                 "mini_attn":
                     mini_attn,
-
-                # -------------------------------------------------
-                # Utility
-                # -------------------------------------------------
 
                 "utility_logits":
                     utility_logits,
@@ -440,10 +493,6 @@ class DynamicMiniMainAttention(nn.Module):
                         "max_confidence"
                     ],
 
-                # -------------------------------------------------
-                # Selection
-                # -------------------------------------------------
-
                 "direct_mask":
                     direct_mask,
 
@@ -455,9 +504,13 @@ class DynamicMiniMainAttention(nn.Module):
                         "direct_indices"
                     ],
 
-                # -------------------------------------------------
-                # Mix
-                # -------------------------------------------------
+                "forced_routing":
+                    selection_info[
+                        "forced_routing"
+                    ],
+
+                "forced_uniform_mix":
+                    forced_uniform_mix,
 
                 "mix_weights":
                     mix_info[
@@ -466,10 +519,6 @@ class DynamicMiniMainAttention(nn.Module):
 
                 "mixed_context":
                     mixed_context,
-
-                # -------------------------------------------------
-                # Binding
-                # -------------------------------------------------
 
                 "binding_logits":
                     binding_info[
@@ -495,10 +544,6 @@ class DynamicMiniMainAttention(nn.Module):
                     binding_info[
                         "mixed_main_mask"
                     ],
-
-                # -------------------------------------------------
-                # Main
-                # -------------------------------------------------
 
                 "main_seeds":
                     main_seeds,
