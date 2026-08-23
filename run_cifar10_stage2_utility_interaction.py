@@ -1694,5 +1694,5 @@ def main():
     )
 
 
-if __name__ == "__mains__":
+if __name__ == "__main__":
     main()
