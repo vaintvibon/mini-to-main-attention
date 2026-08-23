@@ -538,6 +538,8 @@ def run_direct_only_sanity(
             "Block-info length changed during ablation."
         )
 
+    downstream_direct_diffs = []
+
     for block_idx, (
         mix_info,
         direct_info,
@@ -555,6 +557,8 @@ def run_direct_only_sanity(
             "main_seeds"
         ]
 
+        # In every ablated block, the mixed Main seed itself must
+        # be exactly zero after the Binder override.
         if mix_mask.any():
             ablated_values = direct_seed[
                 mix_mask
@@ -591,10 +595,25 @@ def run_direct_only_sanity(
                 ablated_values
             ).abs().max().item()
 
-            if max_diff > 1e-5:
-                raise RuntimeError(
-                    f"Block {block_idx}: non-mixed seed changed "
-                    f"during ablation. max_diff={max_diff}"
+            if block_idx == 0:
+                # Block 0 receives exactly the same input in both runs.
+                # Therefore its Direct seeds must be unchanged.
+                if max_diff > 1e-5:
+                    raise RuntimeError(
+                        f"Block 0: non-mixed Direct seed changed "
+                        f"during the local ablation. max_diff={max_diff}"
+                    )
+            else:
+                # From Block 1 onward, zeroing Block-0 Mix changes the
+                # hidden state entering the downstream block. Direct
+                # Mini contexts / Binder assignments can therefore
+                # legitimately change. This is a causal downstream
+                # consequence of the Mix ablation, not an ablation bug.
+                downstream_direct_diffs.append(
+                    (
+                        block_idx,
+                        max_diff,
+                    )
                 )
 
     logit_delta = (
@@ -612,8 +631,20 @@ def run_direct_only_sanity(
     )
 
     print(
-        "PASS: Direct Main seeds are unchanged."
+        "PASS: Block-0 Direct Main seeds are unchanged."
     )
+
+    if downstream_direct_diffs:
+        print(
+            "NOTE: downstream Direct seeds may change because removing "
+            "an earlier Mix seed changes the hidden state entering later blocks."
+        )
+
+        for block_idx, max_diff in downstream_direct_diffs:
+            print(
+                f"  Block {block_idx} downstream Direct-seed max diff: "
+                f"{max_diff:.8f}"
+            )
 
     print(
         f"Mean absolute logit difference on sanity batch: "
@@ -989,8 +1020,14 @@ def main():
     )
 
     print(
-        "Direct-only: the same Direct heads and same binding are preserved, "
-        "but the mixed Main seed is forced to zero."
+        "Direct-only: the same forced Direct Mini-head pair is used, "
+        "and the mixed Main seed is forced to zero."
+    )
+
+    print(
+        "At Block 0, Direct seeds/binding are directly controlled. "
+        "At later blocks, upstream Mix removal can causally change the hidden state "
+        "and therefore the downstream Binder assignment."
     )
 
     print(
