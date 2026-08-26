@@ -398,7 +398,7 @@ class SelectiveSeededMainAttention(nn.Module):
             if idx.numel() == 0:
                 continue
             contrib = self._one_head(x.index_select(0, idx), seeds[:, h].index_select(0, idx), h)
-            out.index_add_(0, idx, contrib)
+            out.index_add_(0, idx, contrib.to(dtype=out.dtype))
             computed += int(idx.numel())
         out = self.proj_drop(out + self.out_bias[None, None])
         if computed != B * budget:
