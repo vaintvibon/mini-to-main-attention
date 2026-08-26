@@ -250,7 +250,7 @@ class MiniBindingBudgetRouter(nn.Module):
         direct_indices = torch.topk(utility_logits, k=self.direct_k, dim=-1).indices
         direct_mask = torch.zeros(B, Hm, dtype=torch.bool, device=mini_contexts.device)
         direct_mask.scatter_(1, direct_indices, True)
-        rem_logits = utility_logits.masked_fill(direct_mask, -1e9)
+        rem_logits = utility_logits.masked_fill(direct_mask, torch.finfo(utility_logits.dtype).min,)
         mixed_weights = rem_logits.softmax(dim=-1)
         mixed_context = (mini_contexts * mixed_weights[:, :, None, None]).sum(dim=1)
 
@@ -265,7 +265,7 @@ class MiniBindingBudgetRouter(nn.Module):
         for rank in range(self.direct_k):
             mini_idx = direct_indices[:, rank]
             d = self._gather_desc(desc, mini_idx)
-            compat = (d @ slots.t()).masked_fill(hard_used, -1e9)
+            compat = (d @ slots.t()).masked_fill(hard_used, torch.finfo(utility_logits.dtype).min,)
             soft = (compat / self.bind_tau).softmax(dim=-1)
             hard_idx = compat.argmax(dim=-1)
             hard = F.one_hot(hard_idx, num_classes=self.main_heads).to(soft.dtype)
@@ -290,7 +290,7 @@ class MiniBindingBudgetRouter(nn.Module):
             active_hard = bound_main_mask
             active_gate = bound_main_mask.to(mini_contexts.dtype)
         else:
-            available_scores = need_scores.masked_fill(bound_main_mask, -1e9)
+            available_scores = need_scores.masked_fill(bound_main_mask, torch.finfo(utility_logits.dtype).min,)
             hard_extra, st_extra = _st_khot(available_scores, extra_k, self.route_tau)
             hard_extra = hard_extra & (~bound_main_mask)
             active_hard = bound_main_mask | hard_extra
