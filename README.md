@@ -1,25 +1,3 @@
 # Mini-to-Main Attention
 
-This repository implements a Mini-to-Main Two-Level Head Scheduler for Vision Transformers.
-
-## Current Status
-
-Implemented:
-
-- MiniAttention
-- MiniImportance
-- MiniToMainAllocator
-- TwoLevelHeadScheduler
-- TwoLevelMiniMainAttention
-- MiniGuidedBlock
-- MiniGuidedViT
-- HeadDiversityLoss
-- CIFAR-10 sanity training script
-
-Current implementation is v1.
-python test_train_step.py
-python test_diversity_loss.py
-
-##CIFAR-10 Sanity training
-python train_cifar10_sanity.py
-
+적은 계산량으로 먼저 전체적인 정보를 파악하고 해당 정보를 이용해서 Main attention으로 확장
